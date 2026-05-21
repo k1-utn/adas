@@ -1,0 +1,378 @@
+// ADAS — OEM Collision Repair Intelligence Platform
+// Prisma schema. PostgreSQL + pgvector.
+//
+// Design principles:
+//  - Multi-tenant via organizationId on every domain row (row-level scoping).
+//  - Deterministic calibration rules are first-class data (CalibrationRule), not code.
+//  - Everything advisory carries confidence + OEM traceability.
+//  - ProcessingStep and AuditLog are append-only (no updates/deletes in app code).
+
+generator client {
+  provider        = "prisma-client-js"
+  previewFeatures = ["postgresqlExtensions"]
+}
+
+datasource db {
+  provider   = "postgresql"
+  url        = env("DATABASE_URL")
+  extensions = [pgvector(map: "vector")]
+}
+
+// ───────────────────────────── Tenancy & Identity ─────────────────────────────
+
+enum SubscriptionTier {
+  TRIAL
+  STARTER
+  PROFESSIONAL
+  ENTERPRISE
+}
+
+enum Currency {
+  USD
+  CAD
+}
+
+model Organization {
+  id               String           @id @default(cuid())
+  name             String
+  subscriptionTier SubscriptionTier @default(TRIAL)
+  currency         Currency         @default(USD)
+  billingCustomerId String?         // Stripe customer id
+  createdAt        DateTime         @default(now())
+  updatedAt        DateTime         @updatedAt
+
+  shops      Shop[]
+  users      User[]
+  estimates  Estimate[]
+  auditLogs  AuditLog[]
+
+  @@index([subscriptionTier])
+}
+
+model Shop {
+  id             String   @id @default(cuid())
+  organizationId String
+  name           String
+  address        String?
+  city           String?
+  region         String?  // state / province
+  country        String   @default("US")
+  createdAt      DateTime @default(now())
+
+  organization Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  users        User[]
+  estimates    Estimate[]
+
+  @@index([organizationId])
+}
+
+enum UserRole {
+  OWNER          // org admin, billing
+  MANAGER        // production manager
+  ESTIMATOR      // creates/reviews estimates
+  TECHNICIAN     // calibration tech
+  VIEWER         // read-only (e.g. adjuster)
+}
+
+model User {
+  id             String   @id @default(cuid())
+  organizationId String
+  shopId         String?
+  authProviderId String   @unique // Clerk/Auth0 subject
+  email          String   @unique
+  name           String?
+  role           UserRole @default(ESTIMATOR)
+  createdAt      DateTime @default(now())
+  lastSeenAt     DateTime?
+
+  organization   Organization    @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  shop           Shop?           @relation(fields: [shopId], references: [id])
+  estimates      Estimate[]
+  acknowledgements Acknowledgement[]
+  auditLogs      AuditLog[]
+
+  @@index([organizationId])
+  @@index([shopId])
+}
+
+// ───────────────────────────── VIN & Vehicle Profile ─────────────────────────────
+
+model VinRecord {
+  id          String   @id @default(cuid())
+  vin         String   @unique
+  make        String?
+  model       String?
+  trim        String?
+  modelYear   Int?
+  // ADAS profile: structured list of equipped systems & sensors.
+  adasSystems Json?    // e.g. [{ system: "FCW", sensors: ["front_radar","front_camera"] }]
+  decodedBy   String?  // "nhtsa" | "oem_api" | "manual"
+  decodedAt   DateTime @default(now())
+
+  estimates Estimate[]
+
+  @@index([make, model, modelYear])
+}
+
+// ───────────────────────────── Estimates & Line Items ─────────────────────────────
+
+enum EstimateSource {
+  CCC
+  MITCHELL
+  AUDATEX
+  UNKNOWN
+}
+
+enum EstimateStatus {
+  UPLOADED
+  OCR_RUNNING
+  PARSING
+  ANALYZING
+  COMPLETED
+  FAILED
+}
+
+model Estimate {
+  id             String         @id @default(cuid())
+  organizationId String
+  shopId         String?
+  uploadedById   String?
+  vinRecordId    String?
+
+  source         EstimateSource @default(UNKNOWN)
+  status         EstimateStatus @default(UPLOADED)
+  fileKey        String         // object-store key (S3-compatible)
+  fileName       String
+  currency       Currency       @default(USD)
+
+  createdAt      DateTime       @default(now())
+  updatedAt      DateTime       @updatedAt
+
+  organization   Organization   @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  shop           Shop?          @relation(fields: [shopId], references: [id])
+  uploadedBy     User?          @relation(fields: [uploadedById], references: [id])
+  vinRecord      VinRecord?     @relation(fields: [vinRecordId], references: [id])
+
+  lineItems      LineItem[]
+  requirements   CalibrationRequirement[]
+  reports        InsurerReport[]
+  steps          ProcessingStep[]
+  acknowledgements Acknowledgement[]
+
+  @@index([organizationId, status])
+  @@index([shopId])
+}
+
+enum LineItemType {
+  PART
+  LABOR
+  OPERATION
+  SUBLET
+  MISC
+}
+
+model LineItem {
+  id          String       @id @default(cuid())
+  estimateId  String
+  type        LineItemType
+  description String
+  oemPartNo   String?
+  quantity    Float?
+  laborHours  Float?
+  impactZone  String?      // e.g. "front", "left_front", "rear"
+  // Flags set by the parsing agent:
+  isAdasRelated Boolean    @default(false)
+  affectedSystems Json?    // ["front_radar", "lkas_camera"]
+  extractionConfidence Float?  // 0..1
+
+  estimate    Estimate     @relation(fields: [estimateId], references: [id], onDelete: Cascade)
+
+  @@index([estimateId])
+  @@index([isAdasRelated])
+}
+
+// ───────────────────────────── Calibration Rules Engine ─────────────────────────────
+
+enum RequirementKind {
+  PRE_SCAN
+  POST_SCAN
+  STATIC_CALIBRATION
+  DYNAMIC_CALIBRATION
+  RADAR_CALIBRATION
+  CAMERA_AIMING
+  STEERING_ANGLE_RESET
+  WHEEL_ALIGNMENT
+  BATTERY_SUPPORT
+  INITIALIZATION
+}
+
+// Deterministic, data-driven rules. The Calibration Logic Agent matches parsed line
+// items + VIN ADAS profile against these. Rules are versioned and OEM-sourced.
+model CalibrationRule {
+  id           String          @id @default(cuid())
+  kind         RequirementKind
+  // Matching predicate (structured, evaluated by the rules engine):
+  appliesWhen  Json            // e.g. { anySystem: ["front_radar"], makeIn: ["Honda"] }
+  makeScope    String?         // null = all makes
+  modelScope   String?
+  yearFrom     Int?
+  yearTo       Int?
+  rationale    String          // human-readable WHY
+  version      String          @default("1.0.0")
+  isActive     Boolean         @default(true)
+  createdAt    DateTime        @default(now())
+
+  oemReferences OemReference[]
+  requirements  CalibrationRequirement[]
+
+  @@index([kind, isActive])
+  @@index([makeScope, modelScope])
+}
+
+enum ConfidenceBand {
+  HIGH
+  MEDIUM
+  LOW
+}
+
+// A concrete requirement produced for a specific estimate.
+model CalibrationRequirement {
+  id              String          @id @default(cuid())
+  estimateId      String
+  ruleId          String?
+  kind            RequirementKind
+  // WHY this fired, generated/explained by AI but grounded in the rule.
+  explanation     String
+  triggeredByItems Json?          // line item ids that triggered it
+  confidenceScore Float           // 0..1
+  confidenceBand  ConfidenceBand
+  needsHumanReview Boolean        @default(false)
+  isSupplementCandidate Boolean   @default(false)
+  retrievedAt     DateTime        @default(now())
+
+  estimate        Estimate        @relation(fields: [estimateId], references: [id], onDelete: Cascade)
+  rule            CalibrationRule? @relation(fields: [ruleId], references: [id])
+  oemReferences   OemReference[]
+
+  @@index([estimateId])
+  @@index([confidenceBand])
+}
+
+// ───────────────────────────── OEM Procedures & References ─────────────────────────────
+
+model OemProcedure {
+  id          String   @id @default(cuid())
+  make        String
+  model       String?
+  yearFrom    Int?
+  yearTo      Int?
+  title       String
+  sourceUrl   String?
+  sourceDoc   String?  // object-store key for the OEM PDF
+  publishedAt DateTime?
+  ingestedAt  DateTime @default(now())
+
+  chunks      OemProcedureChunk[]
+  references  OemReference[]
+
+  @@index([make, model])
+}
+
+// RAG chunks with embeddings (pgvector). 1536 dims = OpenAI text-embedding-3-small.
+model OemProcedureChunk {
+  id           String                @id @default(cuid())
+  procedureId  String
+  content      String
+  embedding    Unsupported("vector(1536)")?
+  chunkIndex   Int
+
+  procedure    OemProcedure          @relation(fields: [procedureId], references: [id], onDelete: Cascade)
+
+  @@index([procedureId])
+}
+
+// Join: ties a requirement (and/or rule) to the specific OEM evidence behind it.
+model OemReference {
+  id            String   @id @default(cuid())
+  procedureId   String
+  ruleId        String?
+  requirementId String?
+  citation      String   // human-readable citation / section
+  excerpt       String?  // short supporting excerpt (kept minimal)
+  retrievedAt   DateTime @default(now())
+
+  procedure     OemProcedure            @relation(fields: [procedureId], references: [id], onDelete: Cascade)
+  rule          CalibrationRule?        @relation(fields: [ruleId], references: [id])
+  requirement   CalibrationRequirement? @relation(fields: [requirementId], references: [id])
+
+  @@index([procedureId])
+  @@index([requirementId])
+}
+
+// ───────────────────────────── Reports, Trace, Audit ─────────────────────────────
+
+model InsurerReport {
+  id           String   @id @default(cuid())
+  estimateId   String
+  fileKey      String?  // generated PDF in object store
+  summary      String?
+  generatedAt  DateTime @default(now())
+  version      Int      @default(1)
+
+  estimate     Estimate @relation(fields: [estimateId], references: [id], onDelete: Cascade)
+
+  @@index([estimateId])
+}
+
+// Immutable per-job trace. One row per agent/step execution. Replayable.
+model ProcessingStep {
+  id          String   @id @default(cuid())
+  estimateId  String
+  agent       String   // "ESTIMATE_PARSING" | "CALIBRATION_LOGIC" | ...
+  status      String   // "ok" | "retry" | "failed"
+  model       String?  // LLM model used, if any
+  promptVersion String?
+  inputDigest String?  // hash of input for reproducibility
+  outputDigest String?
+  latencyMs   Int?
+  tokensUsed  Int?
+  error       String?
+  createdAt   DateTime @default(now())
+
+  estimate    Estimate @relation(fields: [estimateId], references: [id], onDelete: Cascade)
+
+  @@index([estimateId, agent])
+}
+
+// User verification of advisory output (liability backbone).
+model Acknowledgement {
+  id            String   @id @default(cuid())
+  estimateId    String
+  userId        String
+  statement     String   // exact disclaimer text acknowledged
+  acknowledgedAt DateTime @default(now())
+
+  estimate      Estimate @relation(fields: [estimateId], references: [id], onDelete: Cascade)
+  user          User     @relation(fields: [userId], references: [id])
+
+  @@index([estimateId])
+}
+
+// Append-only audit log. Never updated or deleted by application code.
+model AuditLog {
+  id             String   @id @default(cuid())
+  organizationId String
+  userId         String?
+  action         String   // "estimate.upload" | "report.generate" | ...
+  entityType     String?
+  entityId       String?
+  metadata       Json?
+  ipAddress      String?
+  createdAt      DateTime @default(now())
+
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  user           User?        @relation(fields: [userId], references: [id])
+
+  @@index([organizationId, createdAt])
+  @@index([entityType, entityId])
+}

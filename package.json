@@ -1,0 +1,21 @@
+{
+  "name": "adas-platform",
+  "version": "0.1.0",
+  "private": true,
+  "description": "ADAS — OEM Collision Repair Intelligence Platform",
+  "workspaces": [
+    "packages/*",
+    "apps/*"
+  ],
+  "scripts": {
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "test": "npm run test --workspaces --if-present",
+    "db:generate": "prisma generate --schema packages/db/prisma/schema.prisma",
+    "db:migrate": "prisma migrate dev --schema packages/db/prisma/schema.prisma",
+    "db:seed": "node --import tsx packages/db/prisma/seed.ts"
+  },
+  "devDependencies": {
+    "tsx": "^4.19.0",
+    "typescript": "^5.5.4"
+  }
+}

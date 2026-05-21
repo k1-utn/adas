@@ -1,0 +1,114 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/*
+  ADAS design language — "workshop instrument".
+  Estimators live in this tool. The aesthetic is a precision diagnostic device: dense,
+  monospaced data, a charcoal chassis, signal-amber accents, and confidence states rendered
+  like indicator lamps (green/amber/red). No rounded-pill SaaS softness.
+*/
+
+:root {
+  --font-mono: 'IBM Plex Mono', ui-monospace, monospace;
+  --font-sans: 'IBM Plex Sans', system-ui, sans-serif;
+
+  /* Light theme — bright shop floor */
+  --bg: #f4f3ef;
+  --panel: #ffffff;
+  --panel-edge: #d8d5cc;
+  --ink: #1a1815;
+  --ink-soft: #6b6760;
+  --accent: #c2410c;      /* signal amber-orange */
+  --accent-ink: #ffffff;
+  --grid: #e7e4dc;
+
+  --hi: #15803d;          /* high confidence */
+  --med: #b45309;         /* medium */
+  --lo: #b91c1c;          /* low / needs review */
+}
+
+[data-theme='dark'] {
+  --bg: #131210;
+  --panel: #1c1a17;
+  --panel-edge: #312d27;
+  --ink: #ece9e3;
+  --ink-soft: #8f8980;
+  --accent: #f97316;
+  --accent-ink: #131210;
+  --grid: #26231f;
+
+  --hi: #4ade80;
+  --med: #fbbf24;
+  --lo: #f87171;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font-family: var(--font-sans);
+  /* faint engineering grid for instrument-panel depth */
+  background-image:
+    linear-gradient(var(--grid) 1px, transparent 1px),
+    linear-gradient(90deg, var(--grid) 1px, transparent 1px);
+  background-size: 28px 28px;
+}
+
+.mono { font-family: var(--font-mono); }
+
+.panel {
+  background: var(--panel);
+  border: 1px solid var(--panel-edge);
+}
+
+.label {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--ink-soft);
+}
+
+.lamp { width: 9px; height: 9px; border-radius: 50%; display: inline-block; }
+.lamp-hi { background: var(--hi); box-shadow: 0 0 8px var(--hi); }
+.lamp-med { background: var(--med); box-shadow: 0 0 8px var(--med); }
+.lamp-lo { background: var(--lo); box-shadow: 0 0 8px var(--lo); }
+
+.btn {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  background: var(--accent);
+  color: var(--accent-ink);
+  border: none;
+  padding: 10px 18px;
+  cursor: pointer;
+  transition: filter 0.12s ease;
+}
+.btn:hover { filter: brightness(1.1); }
+.btn:disabled { opacity: 0.4; cursor: not-allowed; }
+
+.btn-ghost {
+  background: transparent;
+  color: var(--ink);
+  border: 1px solid var(--panel-edge);
+}
+
+input[type='text'], input[type='file'] {
+  font-family: var(--font-mono);
+  background: var(--bg);
+  border: 1px solid var(--panel-edge);
+  color: var(--ink);
+  padding: 10px 12px;
+  width: 100%;
+}
+input[type='text']:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+
+@keyframes scan {
+  0% { transform: translateY(-100%); }
+  100% { transform: translateY(2000%); }
+}
